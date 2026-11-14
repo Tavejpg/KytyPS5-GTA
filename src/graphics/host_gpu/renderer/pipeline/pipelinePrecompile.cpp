@@ -133,15 +133,18 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 		// jobs side by side, so the longest of them is the least it all takes.
 		double running = 0.0;
 		double longest = 0.0;
-		for (const double ran: stats.running) {
+		for (size_t i = 0; i < stats.running.size(); i++) {
+			const double ran = stats.running[i];
 			e.helpers_slow += ran >= SlowSeconds ? 1u : 0u;
 			e.helpers_longest = std::max(e.helpers_longest, ran);
-			const double left = std::max(job - ran, ran);
+			// A large one is known to take long before it has run long.
+			const double left = std::max(std::max(job, stats.running_expected[i]) - ran, ran);
 			running += left;
 			longest = std::max(longest, left);
 		}
-		const double   queued  = stats.waiting + backlog.compute_modules * misses;
-		const double   helpers = std::max(longest, (running + queued * job) /
+		const double   queued  = std::max(stats.waiting * job, stats.waiting_seconds) +
+		                         backlog.compute_modules * misses * job;
+		const double   helpers = std::max(longest, (running + queued) /
 		                                               static_cast<double>(std::max(stats.processes, 1u)));
 		const double   threads  = static_cast<double>(std::max(backlog.threads, 1u));
 		const double   graphics = backlog.pipelines * backlog.pipeline_seconds / threads;

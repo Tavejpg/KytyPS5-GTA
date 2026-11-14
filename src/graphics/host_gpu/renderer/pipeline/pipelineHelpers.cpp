@@ -44,6 +44,10 @@ namespace {
 constexpr uint32_t PipelinesPerHelper = 100;
 // Pipelines a helper is given at once: one, so that urgent jobs wait for no queued job.
 constexpr uint32_t JobsPerHelper = 1;
+// A module this large (64k words of SPIR-V), and the least its pipeline is taken to need per byte
+// (see Impl::Expected()).
+constexpr size_t LargeJobBytes   = 256u * 1024u;
+constexpr double LargeJobSeconds = 15e-6;
 // A helper without work for this long exits.
 constexpr auto IdleHelper = std::chrono::seconds(20);
 // After this many helpers that ended without a result, no more are started.
@@ -246,6 +250,8 @@ struct PipelineHelpers::Impl {
 		std::thread                  reader;
 		// The jobs it was sent and has not answered, with when they were sent.
 		std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> in_flight;
+		// Their sizes (Job::module).
+		std::unordered_map<uint64_t, size_t>                                in_flight_bytes;
 		uint32_t                     sent     = 0;
 		uint32_t                     results_received = 0;
 		bool                         retiring = false; // Gets no more jobs.
@@ -276,6 +282,23 @@ struct PipelineHelpers::Impl {
 	uint64_t                             withdrawn = 0;
 	// What a helper took per pipeline lately.
 	PrecompileMean                       job_time;
+	// The time and the size of the helpers' latest pipelines (older ones count less and less).
+	double                               sized_seconds = 0.0;
+	double                               sized_bytes   = 0.0;
+	uint32_t                             sized_jobs    = 0;
+
+	// What a job of `bytes` takes, by the latest pipelines; 0 before a few results. A large one
+	// takes at least LargeJobSeconds a byte, whatever the latest took: the driver's time grows
+	// faster than the size, and the small pipelines, which a title's helpers finish first, say
+	// nothing of its large ones (GTA V's helpers took ~3 us a byte for its 230 pipelines of up to
+	// 50k words of SPIR-V, and 20-75 us a byte for the 52 of 64k-570k words that were left).
+	[[nodiscard]] double Expected(size_t bytes) const {
+		constexpr uint32_t MinJobs = 8;
+		const double       size    = static_cast<double>(bytes);
+		const double       latest  =
+		    sized_jobs >= MinJobs && sized_bytes > 0.0 ? size * sized_seconds / sized_bytes : 0.0;
+		return bytes >= LargeJobBytes ? std::max(latest, size * LargeJobSeconds) : latest;
+	}
 	bool                                 stopping = false;
 	// Results and lost jobs are not reported any more.
 	std::atomic<bool>                    closing {false};
@@ -447,7 +470,16 @@ struct PipelineHelpers::Impl {
 				const auto now  = std::chrono::steady_clock::now();
 				const auto sent = helper.in_flight.find(result.ticket);
 				if (sent != helper.in_flight.end()) {
-					job_time.Add(std::chrono::duration<double>(now - sent->second).count());
+					const auto seconds = std::chrono::duration<double>(now - sent->second).count();
+					job_time.Add(seconds);
+					if (const auto bytes = helper.in_flight_bytes.find(result.ticket);
+					    bytes != helper.in_flight_bytes.end()) {
+						constexpr double Decay = 0.97;
+						sized_seconds = sized_seconds * Decay + seconds;
+						sized_bytes   = sized_bytes * Decay + static_cast<double>(bytes->second);
+						sized_jobs++;
+						helper.in_flight_bytes.erase(bytes);
+					}
 					helper.in_flight.erase(sent);
 				}
 				helper.results_received++;
@@ -467,6 +499,7 @@ struct PipelineHelpers::Impl {
 				lost.push_back(ticket);
 			}
 			helper.in_flight.clear();
+			helper.in_flight_bytes.clear();
 			failed += lost.size();
 			if (helper.results_received == 0) {
 				broken++;
@@ -590,6 +623,7 @@ struct PipelineHelpers::Impl {
 					target->last_progress = now;
 				}
 				target->in_flight.emplace(job.ticket, now);
+				target->in_flight_bytes.emplace(job.ticket, job.module.size());
 				target->last_job = now;
 				if (++target->sent >= PipelinesPerHelper) {
 					target->retiring = true;
@@ -712,9 +746,15 @@ PipelineHelpers::Stats PipelineHelpers::GetStats() const {
 	             .job_seconds = m_impl->job_time.Get()};
 	const auto now = std::chrono::steady_clock::now();
 	for (const auto& helper: m_impl->helpers) {
-		for (const auto sent: helper->in_flight | std::views::values) {
+		for (const auto& [ticket, sent]: helper->in_flight) {
 			stats.running.push_back(std::chrono::duration<double>(now - sent).count());
+			const auto bytes = helper->in_flight_bytes.find(ticket);
+			stats.running_expected.push_back(
+			    bytes != helper->in_flight_bytes.end() ? m_impl->Expected(bytes->second) : 0.0);
 		}
+	}
+	for (const auto& job: m_impl->queue) {
+		stats.waiting_seconds += m_impl->Expected(job.module.size());
 	}
 	stats.in_flight = static_cast<uint32_t>(stats.running.size());
 	return stats;

@@ -72,6 +72,11 @@ public:
 		double   job_seconds = 0.0;
 		// How long each of the jobs sent has run, in seconds.
 		std::vector<double> running;
+		// What the jobs take by their size, as the helpers' pipelines took lately (the driver's time
+		// follows the size of the SPIR-V: a title's largest pipelines take a hundred times the mean):
+		// each of the jobs sent, as `running`, and all the waiting ones. 0 before a few results.
+		std::vector<double> running_expected;
+		double              waiting_seconds = 0.0;
 	};
 	[[nodiscard]] Stats GetStats() const;
 
