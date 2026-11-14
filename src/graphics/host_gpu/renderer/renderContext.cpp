@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/hackNotice.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/shader/recompiler/frontend/decode/RecordReach.h"
 #include "graphics/shader/shaderBindings.h"
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <map>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
@@ -349,6 +351,10 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_image_heap.UnmapMemory(vaddr, size);
 		m_occlusion_queries.OnUnmap(vaddr, size);
+		if (size != 0 && vaddr <= UINT64_MAX - size) {
+			m_guest_bvh_memory.erase(m_guest_bvh_memory.lower_bound(vaddr), m_guest_bvh_memory.lower_bound(vaddr + size));
+			std::erase_if(m_hle_tlases, [&](const HleTlas& tlas) { return tlas.header >= vaddr && tlas.header - vaddr < size; });
+		}
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 		m_mapped_ranges_version++;
@@ -497,6 +503,7 @@ bool RenderContext::SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* 
 	// An index offset or thread ID added to a V# record stays within a wave of records past it.
 	constexpr uint64_t WaveRecords = 64;
 	m_dma_spans.clear();
+	m_dma_sets.clear();
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	const auto add = [&](uint64_t address, uint64_t size) {
 		if (size != 0 && address <= UINT64_MAX - size) {
@@ -510,11 +517,18 @@ bool RenderContext::SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* 
 		if (!program.info.uses_dma) {
 			continue;
 		}
-		if (!program.info.dma_bounded) {
+		if (!program.info.dma_bounded && program.info.ray_query_reach.empty()) {
 			if (!AddRecordReach(*stage)) {
 				return false;
 			}
 			continue;
+		}
+		// A program that traces rays: the guest BVH and the buffers of its alpha tests, then its
+		// windows and tables.
+		if (!program.info.dma_bounded) {
+			if (!AddRayTracingReach(*stage)) {
+				return false;
+			}
 		}
 		const auto& user_data = stage->resources->user_data;
 		const auto  base_of   = [&](uint32_t reg, uint64_t& base) {
@@ -572,6 +586,10 @@ bool RenderContext::SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* 
 	}
 	lock.unlock();
 	m_buffer_cache.SynchronizeBuffersInSpans(m_dma_spans);
+	// The buffers that the V#s of the buffer tables describe.
+	for (auto* table: m_dma_sets) {
+		m_buffer_cache.SynchronizeBuffersInSet(table->ranges, table->regions);
+	}
 	return true;
 }
 
@@ -705,6 +723,230 @@ bool RenderContext::AddRecordReach(const ShaderStageRuntime& runtime) {
 			add(written.address, written.size);
 		}
 	}
+	return true;
+}
+
+void RenderContext::NoteHleTlas(uint64_t header, uint64_t size, std::vector<uint64_t> blases) {
+	// GTA V builds four TLASes a frame, at addresses it keeps.
+	constexpr size_t MaxTlases = 16;
+	for (auto& tlas: m_hle_tlases) {
+		if (tlas.header == header) {
+			tlas.size   = size;
+			tlas.blases = std::move(blases);
+			return;
+		}
+	}
+	if (m_hle_tlases.size() >= MaxTlases) {
+		m_hle_tlases.erase(m_hle_tlases.begin());
+	}
+	m_hle_tlases.push_back({header, size, std::move(blases)});
+}
+
+void RenderContext::ForgetHleTlas(uint64_t header) {
+	std::erase_if(m_hle_tlases, [&](const HleTlas& tlas) { return header == 0 || tlas.header == header; });
+}
+
+void RenderContext::NoteGuestBvhMemory(uint64_t address, uint64_t size) {
+	// The BLASes of a streaming game come and go: forgotten all at once, they are captured again
+	// as the game builds them (the dispatches that trace the others synchronize everything meanwhile).
+	constexpr size_t MaxCaptures = 65536;
+	if (m_guest_bvh_memory.size() >= MaxCaptures) {
+		m_guest_bvh_memory.clear();
+	}
+	m_guest_bvh_memory[address] = size;
+}
+
+bool RenderContext::GuestTlasHeader(const ShaderStageRuntime& runtime, const NativeRayTracing::TlasSource& source,
+                                    uint64_t& header, uint64_t& header_at) {
+	const auto& program   = runtime.module->info;
+	const auto& resources = *runtime.resources;
+	// Memory the CPU wrote last: its current bytes are in guest memory.
+	const auto readable = [this](uint64_t address, uint64_t size) {
+		return GuestRange {address, size}.Valid() && m_mapped_ranges.Contains(address, size) &&
+		       !(m_buffer_cache.MayBeGpuModified(address, size) &&
+		         m_buffer_cache.IsRegionGpuModified(address, size));
+	};
+	header_at             = 0;
+	const auto& user_data = resources.user_data;
+	const auto  index     = uint64_t {source.user_sgpr} - program.user_data_base;
+	uint64_t    pointer   = 0;
+	if (source.user_sgpr >= program.user_data_base && index + 1u < user_data.size()) {
+		pointer = NativeRayTracing::UserPointer(
+		    source, user_data[index] | (uint64_t {user_data[index + 1u]} << 32u), readable);
+	}
+	if (pointer != 0 && pointer <= UINT64_MAX - source.header_offset) {
+		header_at = pointer + source.header_offset;
+	}
+	// The header address as the walk reads it (see NativeRayTracing::Prepare()).
+	const auto& srt    = resources.flattened_srt;
+	const auto  in_srt = [&](uint32_t slot) {
+		return slot != ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot && slot < srt.size();
+	};
+	if (in_srt(source.header_slots[0]) && in_srt(source.header_slots[1])) {
+		header = srt[source.header_slots[0]] | (uint64_t {srt[source.header_slots[1]]} << 32u);
+		return true;
+	}
+	if (header_at == 0 || !readable(header_at, sizeof(header))) {
+		return false;
+	}
+	std::memcpy(&header, reinterpret_cast<const void*>(header_at), sizeof(header));
+	return true;
+}
+
+bool RenderContext::GuestBlasMemory(uint64_t blas, uint64_t& size) {
+	// The header of a BLAS of sce::Psr (the magic, then the size of its memory at +16).
+	constexpr uint64_t HeaderSize = 256;
+	constexpr uint64_t SizeField  = 16;
+	// Larger BLASes are not plausible.
+	constexpr uint64_t MaxSize    = uint64_t {256} * 1024 * 1024;
+	size                          = 0;
+	if (!m_mapped_ranges.Contains(blas, HeaderSize)) {
+		// Nothing a walk could read.
+		return true;
+	}
+	std::array<uint32_t, 2> magic {};
+	uint32_t                field = 0;
+	if (!(m_buffer_cache.MayBeGpuModified(blas, HeaderSize) && m_buffer_cache.IsRegionGpuModified(blas, HeaderSize))) {
+		// The CPU wrote it (a BLAS loaded as it is).
+		std::memcpy(magic.data(), reinterpret_cast<const void*>(blas), sizeof(magic));
+		std::memcpy(&field, reinterpret_cast<const void*>(blas + SizeField), sizeof(field));
+		if (magic[0] != 0x5f525350u || magic[1] != 0x4c485642u) {
+			return false;
+		}
+	} else if (const auto captured = m_guest_bvh_memory.find(blas); captured != m_guest_bvh_memory.end()) {
+		// The GPU built it or decompressed it into memory the library captured.
+		field = static_cast<uint32_t>(std::min<uint64_t>(captured->second, UINT32_MAX));
+	} else if (!Libs::LibKernel::Memory::TryReadAroundGpuWrites(blas + SizeField, &field, sizeof(field))) {
+		// The GPU wrote the size, and the host holds no copy of it.
+		return false;
+	}
+	size = field;
+	return field >= HeaderSize && field <= MaxSize;
+}
+
+bool RenderContext::AddBufferTable(const ShaderBufferResource& table) {
+	// Larger tables, or V#s, are not what an alpha test reads its buffers from.
+	constexpr uint64_t MaxTableBytes  = uint64_t {16} * 1024 * 1024;
+	constexpr size_t   MaxTables      = 4;
+	constexpr uint64_t EntryBytes     = sizeof(table.fields);
+	const auto         address        = table.Base48();
+	const auto         size           = table.GetSize() / EntryBytes * EntryBytes;
+	if (address == 0 || size == 0) {
+		return true;
+	}
+	if (table.Stride() != EntryBytes || size > MaxTableBytes || !m_mapped_ranges.Contains(address, size) ||
+	    (m_buffer_cache.MayBeGpuModified(address, size) && m_buffer_cache.IsRegionGpuModified(address, size))) {
+		return false;
+	}
+	auto cached = std::ranges::find_if(m_buffer_tables, [&](const auto& known) { return known->address == address; });
+	if (cached == m_buffer_tables.end()) {
+		if (m_buffer_tables.size() >= MaxTables) {
+			m_buffer_tables.erase(m_buffer_tables.begin());
+		}
+		m_buffer_tables.push_back(std::make_unique<BufferTable>());
+		cached            = std::prev(m_buffer_tables.end());
+		(*cached)->address = address;
+	}
+	auto&       entries = **cached;
+	const auto* memory  = reinterpret_cast<const uint8_t*>(address);
+	// The table changes when the game streams geometry in or out: its V#s are decoded again then.
+	// While its pages stay clean and none was uploaded, the guest's CPU did not write it since it
+	// was last compared with the copy.
+	const auto uploads = m_buffer_cache.WatchUploads(address, size);
+	const bool dirty   = m_buffer_cache.IsRegionCpuModified(address, size);
+	const bool same    = uploads != 0 && entries.written_at == uploads && !dirty && entries.copy.size() == size;
+	entries.written_at = dirty ? 0 : uploads;
+	if (same) {
+		// (Nothing to decode.)
+	} else if (entries.copy.size() != size || std::memcmp(entries.copy.data(), memory, size) != 0) {
+		entries.copy.assign(memory, memory + size);
+		entries.ranges.Clear();
+		entries.regions = {};
+		for (uint64_t offset = 0; offset < size; offset += EntryBytes) {
+			ShaderBufferResource buffer;
+			std::memcpy(buffer.fields, entries.copy.data() + offset, EntryBytes);
+			// The vertices are read from the base of their V#, at the offsets the indices of the
+			// geometry give: within the buffer the V# describes. What is not guest memory (the
+			// entries of geometry streamed out) has nothing to upload.
+			auto       bytes = buffer.GetSize();
+			const auto base  = buffer.Base48();
+			if (base < LOWER_ADDRESS_SIZE) {
+				bytes = std::min(bytes, LOWER_ADDRESS_SIZE - base);
+			} else if (base >= Libs::LibKernel::Memory::kExtendedMemoryBase &&
+			           base - Libs::LibKernel::Memory::kExtendedMemoryBase < Libs::LibKernel::Memory::kExtendedMemorySize) {
+				bytes = std::min(bytes, Libs::LibKernel::Memory::kExtendedMemorySize -
+				                            (base - Libs::LibKernel::Memory::kExtendedMemoryBase));
+			} else {
+				bytes = 0;
+			}
+			if (base != 0 && bytes != 0) {
+				entries.ranges.Add(base, bytes);
+			}
+		}
+	}
+	m_mapped_ranges.ForEachInRange(address, size, [&](uint64_t start, uint64_t end) { m_dma_spans.emplace_back(start, end); });
+	if (std::ranges::find(m_dma_sets, &entries) == m_dma_sets.end()) {
+		m_dma_sets.push_back(&entries);
+	}
+	return true;
+}
+
+bool RenderContext::AddRayTracingReach(const ShaderStageRuntime& runtime) {
+	const auto&                  program = runtime.module->info;
+	const auto&                  reach   = program.info.ray_query_reach;
+	NativeRayTracing::TlasSource source;
+	uint64_t                     header    = 0;
+	uint64_t                     header_at = 0;
+	if (reach.empty() || reach.size() != 1u + uint64_t {reach[0]} * 2u || !m_native_ray_tracing.Enabled() ||
+	    !NativeRayTracing::FindGuestTlasSource(program.info, source) ||
+	    !GuestTlasHeader(runtime, source, header, header_at)) {
+		return false;
+	}
+	// The TLAS the host built from the instance list (its memory and its BLASes are known); the
+	// walks of another one (a TLAS the game built, or wrote with the CPU) follow GPU-written data.
+	const auto tlas = std::ranges::find_if(m_hle_tlases, [&](const HleTlas& known) { return known.header == header; });
+	if (tlas == m_hle_tlases.end()) {
+		return false;
+	}
+	const auto add = [&](uint64_t address, uint64_t size) {
+		if (size != 0 && address <= UINT64_MAX - size) {
+			m_mapped_ranges.ForEachInRange(address, size,
+			                               [&](uint64_t start, uint64_t end) { m_dma_spans.emplace_back(start, end); });
+		}
+	};
+	// The pointer to the header (the host's walk of the TLAS reads it), the TLAS, the BLASes of
+	// its instances and the BLASes the preparation of the dispatch may walk to build them.
+	if (header_at != 0) {
+		add(header_at, sizeof(header));
+	}
+	add(header, tlas->size);
+	m_walk_blases.clear();
+	m_native_ray_tracing.PendingWalks(m_walk_blases);
+	for (const auto* list: {&tlas->blases, &m_walk_blases}) {
+		for (const auto blas: *list) {
+			uint64_t size = 0;
+			if (!GuestBlasMemory(blas, size)) {
+				return false;
+			}
+			add(blas, size);
+		}
+	}
+	// The material table and the buffer table of each alpha test, and the index and vertex buffers
+	// that the V#s of the buffer table describe.
+	const auto& buffers = runtime.resources->buffers;
+	for (uint32_t test = 0; test < reach[0]; test++) {
+		const auto material = reach[1u + test * 2u];
+		const auto table    = reach[2u + test * 2u];
+		if (material >= buffers.size() || table >= buffers.size()) {
+			return false;
+		}
+		const auto records = DecodeNativeDescriptor<ShaderBufferResource>(buffers[material]);
+		add(records.Base48(), records.GetSize());
+		if (!AddBufferTable(DecodeNativeDescriptor<ShaderBufferResource>(buffers[table]))) {
+			return false;
+		}
+	}
+	m_native_ray_tracing.AnnounceWalks(m_walk_blases);
 	return true;
 }
 

@@ -676,6 +676,12 @@ struct ShaderInfo {
 	// Not empty: the program is not dma_bounded, but everything it reaches through device
 	// addresses follows from a table of records the host can read (Decoder::RecordReach::Pack()).
 	std::vector<uint32_t>            dma_record_reach;
+	// Not empty: the program is not dma_bounded, but everything it reaches through device
+	// addresses is in its windows and tables, in the guest BVH it traces natively and in the
+	// buffers of its alpha tests (Decoder::Program::ray_tracing_reach). The count of alpha tests,
+	// then for each one the buffers of the program (indices into `buffers`) that are its
+	// material table and its buffer table, whose V#s describe index and vertex buffers.
+	std::vector<uint32_t>            ray_query_reach;
 	std::array<uint8_t, 32>          vertex_fetch_components {};
 	int32_t                          vertex_offset_sgpr = -1;
 	int32_t                          instance_offset_sgpr = -1;

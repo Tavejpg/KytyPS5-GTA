@@ -958,6 +958,10 @@ struct Program {
 		std::array<uint32_t, 4> layout {};
 		bool                    valid         = false;
 	} ray_tracing_source;
+	// With the native ray tracing patch applied: the instructions (ascending pc) whose device-address
+	// accesses stay within the guest BVH that the program traces and the buffers of its leaves'
+	// alpha test (see BvhReachRanges() in RayTracingPatch.cpp); empty when that is not known.
+	std::vector<uint32_t> ray_tracing_reach;
 	// What it reaches through device addresses, when it works on a table of records.
 	RecordReach record_reach;
 };

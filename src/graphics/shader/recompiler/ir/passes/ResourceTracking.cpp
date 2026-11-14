@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/hackNotice.h"
+#include "graphics/shader/recompiler/ir/RayQuery.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -456,6 +457,7 @@ public:
 		m_info.dma_tables.clear();
 		m_info.self_sized_buffers.clear();
 		m_info.dma_record_reach.clear();
+		m_info.ray_query_reach.clear();
 		m_info.dma_bounded = false;
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
@@ -478,13 +480,17 @@ public:
 			}
 		}
 		m_info.dma_bounded = m_dma_tracked && !m_dma_unbounded && !m_program.has_address_writes;
-		if (!m_info.dma_bounded) {
+		if (!m_info.dma_bounded && m_dma_tracked && !m_dma_uncovered && !m_program.has_address_writes) {
+			if (m_decoded.record_reach.valid) {
+				m_info.dma_record_reach = m_decoded.record_reach.Pack();
+			} else if (!m_decoded.ray_tracing_reach.empty()) {
+				m_info.ray_query_reach = RayQueryReach();
+			}
+		}
+		// The reach of a program that traces rays holds its windows and tables as well.
+		if (!m_info.dma_bounded && m_info.ray_query_reach.empty()) {
 			m_info.dma_windows.clear();
 			m_info.dma_tables.clear();
-		}
-		if (!m_info.dma_bounded && m_dma_tracked && !m_dma_uncovered && !m_program.has_address_writes &&
-		    m_decoded.record_reach.valid) {
-			m_info.dma_record_reach = m_decoded.record_reach.Pack();
 		}
 		LinkIndirectWriteTables();
 		for (const auto& patch: m_handle_patches) {
@@ -4792,7 +4798,8 @@ private:
 		uint32_t    reg    = 0;
 		if (memory.address_is_full || inst.NumArgs() < 2u || handle == nullptr ||
 		    !UserDataBasePair(*handle, reg)) {
-			NoteUnbounded(InReach(m_decoded.record_reach.read_pcs, inst.Flags<MemoryFlags>().pc));
+			NoteUnbounded(InReach(m_decoded.record_reach.read_pcs, inst.Flags<MemoryFlags>().pc) ||
+			              InBvhReach(inst.Flags<MemoryFlags>().pc));
 			return;
 		}
 		const auto bits = PossibleU32Bits(inst.Arg(1));
@@ -4863,6 +4870,50 @@ private:
 	// reach of the decoded program holds it (see Decoder::RecordReach).
 	static bool InReach(const std::vector<uint32_t>& pcs, uint32_t pc) {
 		return std::ranges::find(pcs, pc) != pcs.end();
+	}
+
+	// The access stays within the guest BVH the program traces (Decoder::Program::ray_tracing_reach).
+	bool InBvhReach(uint32_t pc) const {
+		return std::ranges::binary_search(m_decoded.ray_tracing_reach, pc);
+	}
+
+	// ShaderInfo::ray_query_reach: the buffers of the program that are the material table and the
+	// buffer table of each alpha test, by the V#s the test takes; empty when one is no buffer of
+	// the program (the guest leaf code reads them through the same V#s) or the test is not GTA V's.
+	std::vector<uint32_t> RayQueryReach() const {
+		const auto buffer_of = [&](const Inst& alpha, uint32_t first) {
+			for (uint32_t index = 0; index < m_info.buffers.size(); index++) {
+				const auto& source = m_sources[m_info.buffers[index].source];
+				bool        same   = !source.indirect_descriptor && source.dword_count == 4u;
+				// (The fourth dword holds the format, which a program may patch.)
+				for (uint32_t dword = 0; dword < 3u && same; dword++) {
+					same = EquivalentValue(m_program, source.dwords[dword], alpha.Arg(first + dword));
+				}
+				if (same) {
+					return index;
+				}
+			}
+			return UINT32_MAX;
+		};
+		std::vector<uint32_t> reach {0u};
+		for (const auto* alpha: m_ray_query_alphas) {
+			const auto material = buffer_of(*alpha, 3);
+			const auto table    = buffer_of(*alpha, 7);
+			if ((RayQueryVariant(alpha->Flags<uint32_t>()) & RayQueryAlphaEntry) != 0 || material == UINT32_MAX ||
+			    table == UINT32_MAX) {
+				return {};
+			}
+			bool known = false;
+			for (size_t at = 1; at + 1 < reach.size(); at += 2) {
+				known |= reach[at] == material && reach[at + 1] == table;
+			}
+			if (!known) {
+				reach.push_back(material);
+				reach.push_back(table);
+				reach[0]++;
+			}
+		}
+		return reach;
 	}
 
 	void NoteUnbounded(bool covered = false) {
@@ -5157,9 +5208,14 @@ private:
 		const auto op           = inst.GetOpcode();
 		if (op == ValueOpcode::BvhIntersect || op == ValueOpcode::Bvh8Intersect ||
 		    op == ValueOpcode::RayQueryInit) {
-			// Device addresses: the BVH nodes, or the native ray tracing context.
+			// Device addresses: the BVH nodes, or the native ray tracing context. The node tests of
+			// a program with a known reach are all in its traversal loops.
 			m_dma_tracked = true;
-			NoteUnbounded();
+			NoteUnbounded(!m_decoded.ray_tracing_reach.empty());
+			return;
+		}
+		if (op == ValueOpcode::RayQueryAlpha) {
+			m_ray_query_alphas.push_back(&inst);
 			return;
 		}
 		const auto buffer       = BufferAccessOf(op);
@@ -5232,7 +5288,8 @@ private:
 				m_dma_tracked                           = true;
 				if (handle != nullptr) {
 					NoteDmaDescriptorTable(
-					    *handle, indirect_store && InReach(m_decoded.record_reach.store_pcs, flags.pc));
+					    *handle, (indirect_store && InReach(m_decoded.record_reach.store_pcs, flags.pc)) ||
+					                 (!indirect_store && InBvhReach(flags.pc)));
 				} else {
 					NoteUnbounded();
 				}
@@ -5383,6 +5440,8 @@ private:
 	bool                                       m_dma_unbounded = false;
 	// One of them is not in the record reach of the decoded program either.
 	bool                                       m_dma_uncovered = false;
+	// The RayQueryAlpha instructions of the program (see RayQueryReach()).
+	std::vector<const Inst*>                   m_ray_query_alphas;
 	// A DMA access this pass saw. uses_dma comes later, from the live IR (ShaderInfoCollection):
 	// a DMA access this pass did not see leaves the shader unbounded.
 	bool                                       m_dma_tracked = false;

@@ -760,6 +760,8 @@ public:
 	// Over other instructions of the program (see LevelBranch).
 	SiteFinder(const std::vector<Instruction>& inst, const std::vector<InlinedCallBody>& bodies, bool wave32)
 	    : m_inst(inst), m_bodies(bodies), m_wave32(wave32) {}
+	// Whether the instruction writes VGPR `reg`.
+	static bool WritesVgpr(const Instruction& inst, uint32_t reg) { return WritesVector(inst, reg); }
 
 	// The sites of the program and its TLAS source; false when a traversal loop does not match.
 	bool Find(RayTracingPatch& patch) {
@@ -5849,6 +5851,71 @@ bool DeriveRayTracingPatch(const Program& program, RayTracingPatch& patch, uint3
 	return true;
 }
 
+// The guest code ([first, second) pcs) of a program with traversal sites whose device-address
+// accesses stay within the BVH the program traces, and within the buffers of its alpha test:
+// - the traversal loop of each site: the walk of the TLAS, the setup of an instance and the walk of
+//   its BLAS read nodes, instance records, the BLAS header and its tables; the leaf code reads the
+//   lists of the BLAS and, for its alpha test, the material table and the indices and vertices
+//   that the V#s of the buffer table describe (the tables whose V#s RT_ALPHA takes);
+// - after the loop of a site that accepts any hit, the reads of the instance record of its hit
+//   (GTA V's shadows, cs 48d704640ab9fb40, read a flag of it), while the registers of the result
+//   still hold it: up to the first instruction that writes one, that jumps back or that code
+//   outside the site reaches.
+// Empty when a loop is not a single run of code or a node test of the program is outside the loops.
+static std::vector<std::pair<uint32_t, uint32_t>> BvhReachRanges(const Program& program, const RayTracingPatch& patch) {
+	// Enough for the code that takes the result of a traversal.
+	constexpr uint32_t                         MaxScan = 256;
+	std::vector<std::pair<uint32_t, uint32_t>> ranges;
+	for (const auto& site: patch.sites) {
+		if (site.loop_pc >= site.exit_pc) {
+			return {};
+		}
+		ranges.emplace_back(site.loop_pc, site.exit_pc);
+	}
+	const auto loops = ranges.size();
+	for (const auto& inst: program.instructions) {
+		if ((inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY || inst.opcode == Opcode::IMAGE_BVH8_INTERSECT_RAY) &&
+		    std::none_of(ranges.begin(), ranges.begin() + static_cast<ptrdiff_t>(loops),
+		                 [&](const auto& loop) { return inst.pc >= loop.first && inst.pc < loop.second; })) {
+			return {};
+		}
+	}
+	for (const auto& site: patch.sites) {
+		// (At a site that keeps the closest hit the registers of the result also take the hits the
+		// hardware commits: GTA V's cs 2f34bc2dfe6b04a3 reads other memory through them when it
+		// traces natively.)
+		if (site.kind != RayTracingKind::Packet && site.kind != RayTracingKind::PacketLane) {
+			continue;
+		}
+		const auto low  = site.result_instance;
+		const auto high = site.result_instance_hi != NoRegister ? site.result_instance_hi : low + 1u;
+		auto       it   = std::ranges::lower_bound(program.instructions, site.exit_pc, {}, &Instruction::pc);
+		for (uint32_t scanned = 0; it != program.instructions.end() && scanned < MaxScan; ++it, scanned++) {
+			const auto& inst    = *it;
+			const bool  entered = std::ranges::any_of(program.instructions, [&](const Instruction& branch) {
+				return IsDirectBranch(branch.opcode) && branch.branch_target == inst.pc &&
+				       (branch.pc < site.entry_pc || branch.pc >= inst.pc);
+			});
+			if (entered || inst.opcode == Opcode::S_ENDPGM || inst.opcode == Opcode::UNSUPPORTED ||
+			    inst.opcode == Opcode::S_SETPC_B64 || inst.opcode == Opcode::S_SWAPPC_B64 ||
+			    (IsDirectBranch(inst.opcode) && inst.branch_target <= inst.pc)) {
+				break;
+			}
+			const bool load = inst.opcode == Opcode::FLAT_LOAD_DWORD || inst.opcode == Opcode::FLAT_LOAD_DWORDX2 ||
+			                  inst.opcode == Opcode::FLAT_LOAD_DWORDX3 || inst.opcode == Opcode::FLAT_LOAD_DWORDX4;
+			if (load && inst.src_count == 2 && inst.src0.kind == OperandKind::Vgpr && inst.src0.reg == low &&
+			    inst.src1.kind == OperandKind::Vgpr && inst.src1.reg == high &&
+			    uint64_t {inst.offset} + std::max(inst.data_dwords, 1u) * 4u <= site.layout.record_stride) {
+				ranges.emplace_back(inst.pc, EndPc(inst));
+			}
+			if (SiteFinder::WritesVgpr(inst, low) || SiteFinder::WritesVgpr(inst, high)) {
+				break;
+			}
+		}
+	}
+	return ranges;
+}
+
 bool ApplyRayTracingPatch(const RayTracingPatch& patch, Program& program) {
 	if (program.instructions.empty()) {
 		return false;
@@ -5907,6 +5974,18 @@ bool ApplyRayTracingPatch(const RayTracingPatch& patch, Program& program) {
 		std::ranges::sort(literals, {}, &RuntimeLiteral::pc);
 		program.runtime_literals = std::move(literals);
 		program.call_bodies      = std::move(bodies);
+	}
+	// The instructions the guest code of the reach was placed at: the code where it was and its
+	// copies in the native traversals.
+	program.ray_tracing_reach.clear();
+	const auto reach = BvhReachRanges(program, patch);
+	for (size_t i = 0; i < patched.size() && !reach.empty(); i++) {
+		const auto origin = origins[i];
+		if (origin != UINT32_MAX && std::ranges::any_of(reach, [&](const auto& range) {
+			    return origin >= range.first && origin < range.second;
+		    })) {
+			program.ray_tracing_reach.push_back(patched[i].pc);
+		}
 	}
 	program.instructions       = std::move(patched);
 	program.ray_tracing_source = {.user_sgpr     = patch.user_sgpr,
