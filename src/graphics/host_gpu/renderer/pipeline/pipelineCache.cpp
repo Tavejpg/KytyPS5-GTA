@@ -2263,7 +2263,8 @@ bool PipelineCache::CreateComputePipelineElsewhere(const ShaderModule&          
 		std::lock_guard lock(m_async_mutex);
 		m_helper_jobs.emplace(module.id, &module);
 	}
-	m_helpers->Queue(module.id, EncodeComputeModule(module, spirv), urgent);
+	m_helpers->Queue(module.id, EncodeComputeModule(module, spirv), urgent,
+	                 UseRank(module.info.shader_hash));
 	return true;
 }
 
@@ -2609,6 +2610,9 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	if (const auto found = m_graphics_pipelines.find(key); found != m_graphics_pipelines.end()) {
 		m_last_graphics_key      = key;
 		m_last_graphics_pipeline = &found->second;
+		if (!found->second.use_noted) {
+			NoteUse(found->second, stages);
+		}
 		return &found->second;
 	}
 	if (allow_async) {
@@ -2640,6 +2644,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 				m_last_graphics_key      = key;
 				m_last_graphics_pipeline = &ready;
 				StorePipeline(key);
+				NoteUse(ready, stages);
 				return &ready;
 			}
 			if (!m_async_pending_graphics.contains(key)) {
@@ -2705,6 +2710,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	}
 	StorePipeline(key);
 	NoteCreatedPipeline(started);
+	NoteUse(pipeline, stages);
 	m_last_graphics_key      = key;
 	m_last_graphics_pipeline = &pipeline;
 
@@ -2716,7 +2722,11 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 
 	const auto& module = *input_info.stage.module;
 
+	const ShaderModule* const stages[] = {&module};
 	if (const auto found = m_compute_pipelines.find(module.id); found != m_compute_pipelines.end()) {
+		if (!found->second.use_noted) {
+			NoteUse(found->second, stages);
+		}
 		return found->second;
 	}
 	std::optional<StallScope> stall;
@@ -2726,7 +2736,10 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		std::unique_lock lock(m_async_mutex);
 		for (;;) {
 			if (auto node = m_async_ready_compute.extract(module.id); !node.empty()) {
-				return m_compute_pipelines.insert(std::move(node)).position->second;
+				lock.unlock();
+				auto& ready = m_compute_pipelines.insert(std::move(node)).position->second;
+				NoteUse(ready, stages);
+				return ready;
 			}
 			if (!m_async_pending_compute.contains(module.id)) {
 				ClaimComputePipeline(module.id);
@@ -2783,6 +2796,7 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
 	}
 	NoteCreatedPipeline(started);
+	NoteUse(pipeline, stages);
 
 	return pipeline;
 }
