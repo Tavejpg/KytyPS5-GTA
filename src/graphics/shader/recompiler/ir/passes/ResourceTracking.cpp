@@ -455,6 +455,7 @@ public:
 		m_info.dma_base_registers.clear();
 		m_info.dma_windows.clear();
 		m_info.dma_tables.clear();
+		m_info.dma_record_tables.clear();
 		m_info.self_sized_buffers.clear();
 		m_info.dma_record_reach.clear();
 		m_info.ray_query_reach.clear();
@@ -491,6 +492,7 @@ public:
 		if (!m_info.dma_bounded && m_info.ray_query_reach.empty()) {
 			m_info.dma_windows.clear();
 			m_info.dma_tables.clear();
+			m_info.dma_record_tables.clear();
 		}
 		LinkIndirectWriteTables();
 		for (const auto& patch: m_handle_patches) {
@@ -4863,7 +4865,57 @@ private:
 			}
 			return;
 		}
+		if (NoteDmaRecordTable(handle)) {
+			return;
+		}
 		NoteUnbounded(covered);
+	}
+
+	// A V# of an indirect buffer access whose first three DWORDs are scalar reads of one record of
+	// a buffer of the program, at index * stride + immediate (+4, +8): the buffer is a table of
+	// records that hold a V# each, and the shader reads the buffer of any of them, within its
+	// bounds. The BLAS builds of sce::Psr read the vertices of a geometry so (GTA V's cs
+	// 2adee3faed27c152: the V# of the vertex buffer at +8 of the 120 bytes of each geometry).
+	bool NoteDmaRecordTable(const Inst& handle) {
+		const Inst* first_read   = nullptr;
+		uint32_t    first_offset = 0;
+		for (uint32_t dword = 0; dword < 3u; dword++) {
+			const auto* read = handle.NumArgs() == 4u ? handle.Arg(dword).Resolve().TryInstruction() : nullptr;
+			if (read == nullptr || read->GetOpcode() != ValueOpcode::ReadConstBuffer || read->NumArgs() != 2u ||
+			    read->Flags<MemoryFlags>().index >= m_program.memory_info.size()) {
+				return false;
+			}
+			const auto& memory = m_program.memory_info[read->Flags<MemoryFlags>().index];
+			if (memory.data_bits != 32u || memory.data_dwords != 1u) {
+				return false;
+			}
+			if (dword == 0u) {
+				first_read   = read;
+				first_offset = memory.offset;
+			} else if (!EquivalentValue(m_program, read->Arg(0), first_read->Arg(0)) ||
+			           !EquivalentValue(m_program, read->Arg(1), first_read->Arg(1)) ||
+			           memory.offset != first_offset + dword * 4u) {
+				return false;
+			}
+		}
+		// The table is a buffer the program reads (its scalar reads were collected before), and the
+		// offset of the record a multiple of its size.
+		const auto* table  = first_read->Arg(0).Resolve().TryInstruction();
+		const auto  patch  = std::ranges::find_if(m_handle_patches,
+		                                          [&](const HandlePatch& known) { return known.handle == table; });
+		const auto* scaled = first_read->Arg(1).Resolve().TryInstruction();
+		uint32_t    stride = 0;
+		if (table == nullptr || patch == m_handle_patches.end() || scaled == nullptr ||
+		    scaled->GetOpcode() != ValueOpcode::IMul32 ||
+		    !(ImmediateU32(scaled->Arg(1), stride) || ImmediateU32(scaled->Arg(0), stride)) ||
+		    (stride & 3u) != 0 || (first_offset & 3u) != 0 || uint64_t {first_offset} + 12u > stride) {
+			return false;
+		}
+		const ShaderInfo::DmaRecordTable records {patch->resource, stride, first_offset};
+		if (std::ranges::none_of(m_info.dma_record_tables, [&](const auto& known) { return known == records; })) {
+			m_info.dma_record_tables.push_back(records);
+		}
+		return true;
 	}
 
 	// A DMA access whose footprint the windows and tables do not bound. `covered`: the record
