@@ -2,6 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERDECODER_H_
 
 #include "common/common.h"
+#include "graphics/shader/recompiler/frontend/decode/RecordReach.h"
 
 #include <array>
 #include <magic_enum.hpp>
@@ -957,6 +958,8 @@ struct Program {
 		std::array<uint32_t, 4> layout {};
 		bool                    valid         = false;
 	} ray_tracing_source;
+	// What it reaches through device addresses, when it works on a table of records.
+	RecordReach record_reach;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.

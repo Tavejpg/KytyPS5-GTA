@@ -455,6 +455,7 @@ public:
 		m_info.dma_windows.clear();
 		m_info.dma_tables.clear();
 		m_info.self_sized_buffers.clear();
+		m_info.dma_record_reach.clear();
 		m_info.dma_bounded = false;
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
@@ -480,6 +481,10 @@ public:
 		if (!m_info.dma_bounded) {
 			m_info.dma_windows.clear();
 			m_info.dma_tables.clear();
+		}
+		if (!m_info.dma_bounded && m_dma_tracked && !m_dma_uncovered && !m_program.has_address_writes &&
+		    m_decoded.record_reach.valid) {
+			m_info.dma_record_reach = m_decoded.record_reach.Pack();
 		}
 		LinkIndirectWriteTables();
 		for (const auto& patch: m_handle_patches) {
@@ -4787,12 +4792,12 @@ private:
 		uint32_t    reg    = 0;
 		if (memory.address_is_full || inst.NumArgs() < 2u || handle == nullptr ||
 		    !UserDataBasePair(*handle, reg)) {
-			m_dma_unbounded = true;
+			NoteUnbounded(InReach(m_decoded.record_reach.read_pcs, inst.Flags<MemoryFlags>().pc));
 			return;
 		}
 		const auto bits = PossibleU32Bits(inst.Arg(1));
 		if (bits >= MaxWindowBytes) {
-			m_dma_unbounded = true;
+			NoteUnbounded();
 			return;
 		}
 		const auto immediate = static_cast<int64_t>(static_cast<int32_t>(memory.offset));
@@ -4812,7 +4817,8 @@ private:
 	// A V# of an indirect buffer access whose first three DWORDs are scalar address reads of one
 	// table entry at base + offset + immediate (+4, +8): the shader reads the buffer the entry
 	// describes. The fourth DWORD only holds the format and selects, which a shader may patch.
-	void NoteDmaDescriptorTable(const Inst& handle) {
+	// `covered`: the record reach holds the access (see NoteUnbounded()).
+	void NoteDmaDescriptorTable(const Inst& handle, bool covered) {
 		// Entries the host would decode per draw: more are no better than a full synchronization.
 		constexpr uint32_t MaxOffsetBits = 12;
 		const Inst*        first_read    = nullptr;
@@ -4850,7 +4856,18 @@ private:
 			}
 			return;
 		}
+		NoteUnbounded(covered);
+	}
+
+	// A DMA access whose footprint the windows and tables do not bound. `covered`: the record
+	// reach of the decoded program holds it (see Decoder::RecordReach).
+	static bool InReach(const std::vector<uint32_t>& pcs, uint32_t pc) {
+		return std::ranges::find(pcs, pc) != pcs.end();
+	}
+
+	void NoteUnbounded(bool covered = false) {
 		m_dma_unbounded = true;
+		m_dma_uncovered |= !covered;
 	}
 
 	// A DMA address is usually a 64-bit base from a user-data register pair plus a per-lane
@@ -5141,8 +5158,8 @@ private:
 		if (op == ValueOpcode::BvhIntersect || op == ValueOpcode::Bvh8Intersect ||
 		    op == ValueOpcode::RayQueryInit) {
 			// Device addresses: the BVH nodes, or the native ray tracing context.
-			m_dma_tracked   = true;
-			m_dma_unbounded = true;
+			m_dma_tracked = true;
+			NoteUnbounded();
 			return;
 		}
 		const auto buffer       = BufferAccessOf(op);
@@ -5167,8 +5184,8 @@ private:
 				m_dma_tracked = true;
 				NoteDmaWindow(inst, memory);
 			} else if (!memory.planning_only && address_info.access != AddressAccess::None) {
-				m_dma_tracked   = true;
-				m_dma_unbounded = true;
+				m_dma_tracked = true;
+				NoteUnbounded();
 			}
 			return;
 		}
@@ -5214,9 +5231,10 @@ private:
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_dma_tracked                           = true;
 				if (handle != nullptr) {
-					NoteDmaDescriptorTable(*handle);
+					NoteDmaDescriptorTable(
+					    *handle, indirect_store && InReach(m_decoded.record_reach.store_pcs, flags.pc));
 				} else {
-					m_dma_unbounded = true;
+					NoteUnbounded();
 				}
 				return;
 			}
@@ -5224,7 +5242,7 @@ private:
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_dma_tracked                           = true;
 				// The record count bounds the reach, and the host does not know it.
-				m_dma_unbounded = true;
+				NoteUnbounded();
 				return;
 			}
 			resource = AddBuffer(source, memory, op, flags.pc);
@@ -5280,7 +5298,7 @@ private:
 			if (address_info.access == AddressAccess::Read) {
 				NoteDmaWindow(inst, memory);
 			} else {
-				m_dma_unbounded = true;
+				NoteUnbounded();
 			}
 			return;
 		}
@@ -5363,6 +5381,8 @@ private:
 	bool                                       m_shader_writes = false;
 	// A DMA access whose footprint is not bounded (see NoteDmaWindow()).
 	bool                                       m_dma_unbounded = false;
+	// One of them is not in the record reach of the decoded program either.
+	bool                                       m_dma_uncovered = false;
 	// A DMA access this pass saw. uses_dma comes later, from the live IR (ShaderInfoCollection):
 	// a DMA access this pass did not see leaves the shader unbounded.
 	bool                                       m_dma_tracked = false;
