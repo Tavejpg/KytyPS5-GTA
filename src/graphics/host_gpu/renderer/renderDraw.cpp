@@ -447,8 +447,7 @@ static void ClampRenderAreaToHostImage(RenderState& state, const Image& image, u
 	static std::atomic<uint32_t> log_count = 0;
 	if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
 		std::printf("%s target at 0x%016" PRIx64 " is smaller than the render area: host=%ux%u "
-		            "(mip %u) render_area=%ux%u, clamping
-",
+		            "(mip %u) render_area=%ux%u, clamping\n",
 		            kind, address, width, height, level, state.width, state.height);
 	}
 	state.width  = std::min(state.width, width);
